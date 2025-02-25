@@ -1,0 +1,280 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Binance Term Structure Arbitrage Program
+=======================================
+This program monitors price differences between spot and futures markets on Binance
+to identify and potentially execute term structure arbitrage opportunities.
+"""
+
+import os
+import time
+import json
+import logging
+from datetime import datetime
+import requests
+from binance.client import Client
+from binance.exceptions import BinanceAPIException
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("arbitrage.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("binance_term_arbitrage")
+
+class BinanceTermArbitrage:
+    """
+    A class to identify and execute term structure arbitrage opportunities on Binance
+    between spot markets and futures markets.
+    """
+    
+    def __init__(self, api_key=None, api_secret=None, test_mode=True):
+        """
+        Initialize the arbitrage bot with API credentials.
+        
+        Args:
+            api_key (str): Binance API key
+            api_secret (str): Binance API secret
+            test_mode (bool): If True, will not execute actual trades
+        """
+        self.api_key = api_key or os.environ.get('BINANCE_API_KEY')
+        self.api_secret = api_secret or os.environ.get('BINANCE_API_SECRET')
+        self.test_mode = test_mode
+        
+        if not self.api_key or not self.api_secret:
+            logger.warning("API key or secret not provided. Running in read-only mode.")
+            self.client = Client()
+        else:
+            self.client = Client(self.api_key, self.api_secret)
+        
+        # Parameters for arbitrage
+        self.min_profit_threshold = 0.5  # Minimum profit percentage to execute trades
+        self.trading_pairs = ['BTC', 'ETH', 'BNB']  # Default trading pairs to monitor
+        self.trade_amount = 0.01  # Default amount to trade in BTC (adjust for other pairs)
+        
+        # Store arbitrage opportunities
+        self.opportunities = []
+        
+    def get_spot_price(self, symbol):
+        """Get current spot price for a symbol."""
+        try:
+            ticker = self.client.get_symbol_ticker(symbol=f"{symbol}USDT")
+            return float(ticker['price'])
+        except BinanceAPIException as e:
+            logger.error(f"Error getting spot price for {symbol}: {e}")
+            return None
+    
+    def get_futures_price(self, symbol):
+        """Get current futures price for a symbol."""
+        try:
+            ticker = self.client.futures_symbol_ticker(symbol=f"{symbol}USDT")
+            return float(ticker['price'])
+        except BinanceAPIException as e:
+            logger.error(f"Error getting futures price for {symbol}: {e}")
+            return None
+    
+    def get_funding_rate(self, symbol):
+        """Get current funding rate for a symbol in futures market."""
+        try:
+            funding_info = self.client.futures_funding_rate(symbol=f"{symbol}USDT")
+            if funding_info:
+                return float(funding_info[0]['fundingRate']) * 100  # Convert to percentage
+            return None
+        except BinanceAPIException as e:
+            logger.error(f"Error getting funding rate for {symbol}: {e}")
+            return None
+    
+    def calculate_premium(self, spot_price, futures_price):
+        """Calculate the premium percentage between spot and futures prices."""
+        if spot_price and futures_price:
+            premium = ((futures_price - spot_price) / spot_price) * 100
+            return round(premium, 4)
+        return None
+    
+    def find_arbitrage_opportunities(self):
+        """
+        Find arbitrage opportunities by comparing spot and futures prices.
+        Returns a list of opportunities.
+        """
+        opportunities = []
+        
+        for symbol in self.trading_pairs:
+            spot_price = self.get_spot_price(symbol)
+            futures_price = self.get_futures_price(symbol)
+            funding_rate = self.get_funding_rate(symbol)
+            
+            if spot_price and futures_price:
+                premium = self.calculate_premium(spot_price, futures_price)
+                
+                opportunity = {
+                    'timestamp': datetime.now().isoformat(),
+                    'symbol': symbol,
+                    'spot_price': spot_price,
+                    'futures_price': futures_price,
+                    'premium_percent': premium,
+                    'funding_rate': funding_rate,
+                    'profitable': abs(premium) > self.min_profit_threshold
+                }
+                
+                if opportunity['profitable']:
+                    if premium > 0:
+                        # Futures price > spot price: Sell futures, buy spot
+                        opportunity['strategy'] = 'Sell futures, buy spot'
+                    else:
+                        # Spot price > futures price: Buy futures, sell spot
+                        opportunity['strategy'] = 'Buy futures, sell spot'
+                    
+                    logger.info(f"Arbitrage opportunity found: {opportunity}")
+                    opportunities.append(opportunity)
+                else:
+                    logger.debug(f"No profitable arbitrage for {symbol}: premium = {premium}%")
+            
+        self.opportunities.extend(opportunities)
+        return opportunities
+    
+    def execute_arbitrage(self, opportunity):
+        """
+        Execute the arbitrage trade based on the identified opportunity.
+        
+        Args:
+            opportunity (dict): The arbitrage opportunity to execute
+        
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        if self.test_mode:
+            logger.info(f"TEST MODE: Would execute {opportunity['strategy']} for {opportunity['symbol']}")
+            return True
+        
+        symbol = opportunity['symbol']
+        strategy = opportunity['strategy']
+        
+        try:
+            if strategy == 'Sell futures, buy spot':
+                # Sell futures
+                futures_order = self.client.futures_create_order(
+                    symbol=f"{symbol}USDT",
+                    side="SELL",
+                    type="MARKET",
+                    quantity=self.trade_amount
+                )
+                
+                # Buy spot
+                spot_order = self.client.create_order(
+                    symbol=f"{symbol}USDT",
+                    side="BUY",
+                    type="MARKET",
+                    quantity=self.trade_amount
+                )
+                
+                logger.info(f"Executed arbitrage: {strategy} for {symbol}")
+                logger.info(f"Futures order: {futures_order}")
+                logger.info(f"Spot order: {spot_order}")
+                
+            elif strategy == 'Buy futures, sell spot':
+                # Buy futures
+                futures_order = self.client.futures_create_order(
+                    symbol=f"{symbol}USDT",
+                    side="BUY",
+                    type="MARKET",
+                    quantity=self.trade_amount
+                )
+                
+                # Sell spot
+                spot_order = self.client.create_order(
+                    symbol=f"{symbol}USDT",
+                    side="SELL",
+                    type="MARKET",
+                    quantity=self.trade_amount
+                )
+                
+                logger.info(f"Executed arbitrage: {strategy} for {symbol}")
+                logger.info(f"Futures order: {futures_order}")
+                logger.info(f"Spot order: {spot_order}")
+            
+            return True
+        
+        except BinanceAPIException as e:
+            logger.error(f"Error executing arbitrage: {e}")
+            return False
+    
+    def save_opportunities(self, filename='arbitrage_opportunities.json'):
+        """Save identified arbitrage opportunities to a JSON file."""
+        with open(filename, 'w') as f:
+            json.dump(self.opportunities, f, indent=4)
+        logger.info(f"Saved {len(self.opportunities)} opportunities to {filename}")
+    
+    def load_opportunities(self, filename='arbitrage_opportunities.json'):
+        """Load arbitrage opportunities from a JSON file."""
+        try:
+            with open(filename, 'r') as f:
+                self.opportunities = json.load(f)
+            logger.info(f"Loaded {len(self.opportunities)} opportunities from {filename}")
+        except FileNotFoundError:
+            logger.warning(f"File {filename} not found.")
+    
+    def run(self, interval=60, duration=None):
+        """
+        Run the arbitrage bot continuously.
+        
+        Args:
+            interval (int): Time between checks in seconds
+            duration (int, optional): How long to run in seconds, None for indefinite
+        """
+        start_time = time.time()
+        iteration = 0
+        
+        logger.info(f"Starting term arbitrage bot with interval {interval}s")
+        
+        try:
+            while True:
+                iteration += 1
+                logger.info(f"Iteration {iteration}: Checking for arbitrage opportunities")
+                
+                opportunities = self.find_arbitrage_opportunities()
+                
+                for opportunity in opportunities:
+                    if not self.test_mode and opportunity['profitable']:
+                        self.execute_arbitrage(opportunity)
+                
+                # Save opportunities after every 10 iterations
+                if iteration % 10 == 0:
+                    self.save_opportunities()
+                
+                # Check if duration limit is reached
+                if duration and (time.time() - start_time) > duration:
+                    logger.info(f"Duration limit of {duration}s reached. Stopping.")
+                    break
+                
+                logger.info(f"Sleeping for {interval} seconds...")
+                time.sleep(interval)
+                
+        except KeyboardInterrupt:
+            logger.info("Bot stopped by user.")
+        finally:
+            self.save_opportunities()
+            logger.info("Saved final results.")
+
+
+if __name__ == "__main__":
+    """Main function to run the arbitrage bot."""
+    # You can set your API keys here or as environment variables
+    api_key = os.environ.get('BINANCE_API_KEY')
+    api_secret = os.environ.get('BINANCE_API_SECRET')
+    
+    # Create and run the arbitrage bot
+    bot = BinanceTermArbitrage(api_key=api_key, api_secret=api_secret, test_mode=True)
+    
+    # Customize trading pairs if needed
+    bot.trading_pairs = ['BTC', 'ETH', 'BNB', 'ADA', 'DOT']
+    
+    # Set profit threshold (in percentage)
+    bot.min_profit_threshold = 0.75
+    
+    # Run the bot with 2-minute interval
+    bot.run(interval=120)
